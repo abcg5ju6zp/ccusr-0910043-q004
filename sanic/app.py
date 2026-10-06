@@ -80,6 +80,7 @@ from sanic.models.futures import (
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
 from sanic.request import Request
+from sanic.request.branch import branch_registry
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
 from sanic.server.websockets.impl import ConnectionClosed
@@ -126,6 +127,7 @@ class Sanic(
         "_asgi_app",
         "_asgi_lifespan",
         "_asgi_client",
+        "_branch_shutdown_registered",
         "_blueprint_order",
         "_delayed_tasks",
         "_ext",
@@ -330,6 +332,9 @@ class Sanic(
         self.strict_slashes: bool = strict_slashes
         self.websocket_enabled: bool = False
         self.websocket_tasks: set[Future[Any]] = set()
+        # 首个上下文分支派生时才挂载停机监听器，避免不使用分支的应用
+        # 额外出现一条 signal 路由。
+        self._branch_shutdown_registered = False
 
         # Register alternative method names
         self.go_fast = self.run
@@ -1277,6 +1282,25 @@ class Sanic(
     def _cancel_websocket_tasks(cls, app):
         for task in app.websocket_tasks:
             task.cancel()
+
+    @staticmethod
+    async def _shutdown_request_branches(app: Sanic) -> None:
+        """worker 停机：取消仍存活的上下文分支并等待其清理完成。
+
+        分支业务体与清理体都保证最多执行一次；单个分支收尾失败不会
+        阻止其他分支取消。已通过 request.accept_branch 转交责任的分支
+        由接收方负责，此处不再追踪。
+        """
+        await branch_registry.shutdown(app)
+
+    def ensure_branch_shutdown_listener(self) -> None:
+        """首次派生上下文分支时挂载停机收尾（每应用仅一次）。"""
+        if self._branch_shutdown_registered:
+            return
+        self._branch_shutdown_registered = True
+        self.register_listener(
+            self._shutdown_request_branches, "before_server_stop"
+        )
 
     @staticmethod
     async def _listener(

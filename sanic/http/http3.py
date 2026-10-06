@@ -108,26 +108,31 @@ class HTTPReceiver(Receiver, Stream):
         self.stage = Stage.HANDLER
         self.head_only = self.request.method.upper() == "HEAD"
 
-        if exception:
-            logger.info(  # no cov
-                f"{Colors.BLUE}[exception]: "
-                f"{Colors.RED}{exception}{Colors.END}",
-                exc_info=True,
-                extra={"verbosity": 1},
-            )
-            await self.error_response(exception)
-        else:
-            try:
+        try:
+            if exception:
                 logger.info(  # no cov
-                    f"{Colors.BLUE}[request]:{Colors.END} {self.request}",
+                    f"{Colors.BLUE}[exception]: "
+                    f"{Colors.RED}{exception}{Colors.END}",
+                    exc_info=True,
                     extra={"verbosity": 1},
                 )
-                await self.protocol.request_handler(self.request)
-            except Exception as e:  # no cov
-                # This should largely be handled within the request handler.
-                # But, just in case...
-                await self.run(e)
-        self.stage = Stage.IDLE
+                await self.error_response(exception)
+            else:
+                try:
+                    logger.info(  # no cov
+                        f"{Colors.BLUE}[request]:{Colors.END} {self.request}",
+                        extra={"verbosity": 1},
+                    )
+                    await self.protocol.request_handler(self.request)
+                except Exception as e:  # no cov
+                    # This should largely be handled within the request
+                    # handler. But, just in case...
+                    await self.run(e)
+        finally:
+            # 请求处理结束（含异常路径）：普通子任务持有的请求上下文
+            # 随即失效；需要延后的工作只能通过 spawn_branch 脱离。
+            self.request.finalize()
+            self.stage = Stage.IDLE
 
     async def error_response(self, exception: Exception) -> None:
         """项目内部接口说明。"""

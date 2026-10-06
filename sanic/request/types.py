@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from asyncio import BaseProtocol
+from asyncio import BaseProtocol, get_running_loop
 from collections import defaultdict
 from contextvars import ContextVar
 from inspect import isawaitable
@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
+    Callable,
     Generic,
     cast,
 )
@@ -57,6 +59,14 @@ from sanic.log import error_logger
 from sanic.models.protocol_types import TransportProtocol
 from sanic.response import BaseHTTPResponse, HTTPResponse
 
+from .branch import (
+    BranchCleanup,
+    BranchDiagnostic,
+    RequestContextBranch,
+    RequestSnapshot,
+    attach_branch,
+    branch_registry,
+)
 from .form import parse_multipart_form
 from .parameters import RequestParameters
 
@@ -91,8 +101,10 @@ class Request(Generic[sanic_type, ctx_type]):
 
     __slots__ = (
         "__weakref__",
+        "_branches",
         "_cookies",
         "_ctx",
+        "_finalized",
         "_id",
         "_ip",
         "_parsed_url",
@@ -188,6 +200,10 @@ class Request(Generic[sanic_type, ctx_type]):
         self.stream: Stream | None = None
         self._match_info: dict[str, Any] = {}
         self._protocol: BaseProtocol | None = None
+        # 普通子任务共享的请求上下文是否已随请求结束失效；
+        # 脱离请求的工作通过 spawn_branch 领取快照，不计入此处。
+        self._branches: set[RequestContextBranch] = set()
+        self._finalized = False
 
     def __repr__(self):
         class_name = self.__class__.__name__
@@ -200,11 +216,91 @@ class Request(Generic[sanic_type, ctx_type]):
 
     @classmethod
     def get_current(cls) -> Request:
-        """项目内部接口说明。"""
+        """当前正在处理的请求。
+
+        请求结束后，共享其上下文的普通子任务再调用本方法会得到与
+        “没有请求”相同的错误——请求对象可能已在同一连接上被下一位
+        用户复用，因此拒绝返回。需要比请求活得更久的工作应使用
+        :meth:`spawn_branch` 领取最小化快照，而不是依赖本方法。
+        """
         request = cls._current.get(None)
-        if not request:
+        if not request or request._finalized:
             raise ServerError("No current request")
         return request
+
+    # ---------------------------------------------------------------- #
+    # 上下文分支托管
+    # ---------------------------------------------------------------- #
+
+    def finalize(self) -> None:
+        """声明请求处理结束，使共享上下文的普通子任务随之失效。
+
+        幂等：在取消、异常等路径下重复调用没有副作用。已通过
+        :meth:`spawn_branch` 脱离请求的分支不受影响——它们持有的是
+        快照而非本请求。
+
+        注意：本方法不重置 ContextVar。keep-alive 连接上解析下一请求时
+        会覆盖当前值；已派生出的普通子任务仍解析到本对象，只是对象已被
+        标记失效，``get_current`` 拒绝返回它。
+        """
+        self._finalized = True
+
+    @property
+    def finalized(self) -> bool:
+        """请求是否已结束（普通子任务据此失效）。"""
+        return self._finalized
+
+    def spawn_branch(
+        self,
+        body: Callable[[RequestSnapshot], Awaitable[Any]],
+        *,
+        cleanup: BranchCleanup | None = None,
+        name: str | None = None,
+    ) -> RequestContextBranch:
+        """派生一个比请求活得更久的上下文分支。
+
+        ``body`` 只接收最小化快照，不接收请求对象本身，因此无法读取
+        请求头、cookie、token 或下一位用户复用后的任何值。``cleanup``
+        是分支必须完成的清理责任，在业务正常结束、抛错或被取消时都会
+        恰好执行一次。返回的 :class:`RequestContextBranch` 可用于
+        ``cancel`` 或责任转交（``claim``）。
+        """
+        if self._finalized:
+            raise ServerError("Cannot spawn a branch from a finalized request")
+        # 首个分支出现时才挂载 worker 停机收尾，不影响不使用分支的应用。
+        self.app.ensure_branch_shutdown_listener()
+        branch = RequestContextBranch(
+            self, body=body, cleanup=cleanup, name=name
+        )
+        self._branches.add(branch)
+
+        loop = get_running_loop()
+        task = loop.create_task(branch.run(), name=name)
+        attach_branch(branch, task, self.app)
+        return branch
+
+    def accept_branch(
+        self,
+        branch: RequestContextBranch,
+        custodian: object,
+    ) -> None:
+        """将分支的完成责任转交给持久宿主。
+
+        转交后本 worker 停机不再取消该分支，清理责任由接收方承担。
+        只能转交仍在运行、且确实由本请求派生的分支。
+        """
+        if branch not in self._branches:
+            raise ServerError("Branch is not owned by this request")
+        branch.claim(custodian)
+
+    @classmethod
+    def live_branches(cls, app: Any | None = None) -> list[BranchDiagnostic]:
+        """诊断接口：仍存活分支来自哪个请求。
+
+        只返回方法、路径、请求 ID 等溯源信息，不包含任何请求头、
+        cookie、token 或其他敏感值。
+        """
+        return [branch.diagnostic() for branch in branch_registry.alive(app)]
 
     @classmethod
     def generate_id(*_) -> uuid.UUID | str | int:

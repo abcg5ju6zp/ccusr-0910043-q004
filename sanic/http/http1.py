@@ -121,10 +121,13 @@ class Http(Stream, metaclass=TouchUpMeta):
             except CancelledError as exc:
                 # Write an appropriate response before exiting
                 if not self.protocol.transport:
-                    logger.info(
-                        f"Request: {self.request.method} {self.request.url} "
-                        "stopped. Transport is closed."
-                    )
+                    if self.request is not None:
+                        logger.info(
+                            f"Request: {self.request.method} "
+                            f"{self.request.url} stopped. "
+                            "Transport is closed."
+                        )
+                        self.request.finalize()
                     return
                 e = (
                     RequestCancelled()
@@ -164,6 +167,10 @@ class Http(Stream, metaclass=TouchUpMeta):
                 self.request.stream = None
                 if self.response:
                     self.response.stream = None
+                # 请求处理到此结束：共享上下文的普通子任务不再允许
+                # 通过 get_current 读取本请求，以免连接复用时读到下一位
+                # 用户的身份。需要延后的工作必须通过 spawn_branch 脱离。
+                self.request.finalize()
 
     async def http1_request_header(self):  # no cov
         """项目内部接口说明。"""

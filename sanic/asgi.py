@@ -243,3 +243,7 @@ class ASGIApp:
                 await self.sanic_app.handle_exception(self.request, e)
             except Exception as exc:
                 await self.sanic_app.handle_exception(self.request, exc, False)
+        finally:
+            # 请求处理结束（含异常路径）：普通子任务持有的请求上下文
+            # 随即失效；需要延后的工作只能通过 spawn_branch 脱离。
+            self.request.finalize()
